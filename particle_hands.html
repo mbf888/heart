@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>双手交互 3D 粒子系统</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
+  /* 摄像头画面作为全屏背景 */
+  #input_video {
+    position: fixed; inset: 0; width: 100vw; height: 100vh;
+    object-fit: cover; transform: scaleX(-1); /* 镜像成自拍视角 */
+    z-index: 0; background: #000;
+  }
+  /* 透明画布叠加在视频之上 */
+  #glcanvas { position: fixed; inset: 0; z-index: 1; }
+  /* 状态信息浮层 */
+  #hud {
+    position: fixed; left: 16px; top: 16px; z-index: 2;
+    color: #fff; font: 14px/1.5 -apple-system, "Microsoft YaHei", sans-serif;
+    text-shadow: 0 1px 3px rgba(0,0,0,.8); pointer-events: none;
+  }
+  #hud b { color: #ff9ed8; }
+  #tip {
+    position: fixed; left: 16px; bottom: 16px; z-index: 2;
+    color: #ddd; font: 13px/1.6 -apple-system, "Microsoft YaHei", sans-serif;
+    text-shadow: 0 1px 3px rgba(0,0,0,.8); pointer-events: none; max-width: 60vw;
+  }
+  #err {
+    position: fixed; inset: 0; z-index: 5; display: none;
+    align-items: center; justify-content: center; color: #fff;
+    background: rgba(0,0,0,.85); font: 16px/1.6 sans-serif; text-align: center; padding: 24px;
+  }
+</style>
+</head>
+<body>
+  <video id="input_video" autoplay playsinline muted></video>
+  <canvas id="glcanvas"></canvas>
+  <div id="hud">
+    当前文字模式: <b id="hud_mode">HELLO</b><br/>
+    右手状态: <b id="hud_right">展开(文字)</b><br/>
+    左手手指: <b id="hud_left">-</b>
+  </div>
+  <div id="tip">
+    操作说明：<br/>
+    · 右手张开 → 粒子扩散并组成文字；右手握拳 → 粒子收缩成跳动的 3D 爱心（屏幕正中）。<br/>
+    · 左手伸出 1 / 2 / 3 根手指 → 切换文字 HELLO / 好想你 / 我爱你。<br/>
+    · 所有状态下粒子都会躲避左手所在区域；扩散后粒子更慢、更多、更小，并跟随右手旋转方向转动。
+  </div>
+  <div id="err"></div>
+
+  <!-- 常规 <script> 方式从 CDN 引入 MediaPipe 与 Three.js 全局变量 -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.137.0/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+
+  <script>
+  (function () {
+    "use strict";
+
+    // ---------- 基础常量 ----------
+    const MAX        = 7000;   // 粒子缓冲上限
+    const ACTIVE_TEXT  = 6500; // 扩散(文字)时激活的粒子数（更多）
+    const ACTIVE_HEART = 3500; // 收缩(爱心)时激活的粒子数（更少、更大）
+    const FOV = 55, CAM_Z = 70;
+
+    const WORDS = { 1: "HELLO", 2: "好想你", 3: "我爱你" };
+
+    // ---------- Three.js 场景 ----------
+    const canvas = document.getElementById("glcanvas");
+    const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
+    renderer.setClearColor(0x000000, 0);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(FOV, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 0, CAM_Z);
+
+    // 当前可见的世界尺寸（z=0 平面）
+    let viewW = 1, viewH = 1;
+    function computeView() {
+      viewH = 2 * Math.tan((FOV * Math.PI / 180) / 2) * CAM_Z;
+      viewW = viewH * camera.aspect;
+    }
+
+    // ---------- 粒子缓冲 ----------
+    const positions = new Float32Array(MAX * 3);
+    const velocities = new Float32Array(MAX * 3);
+    const aColor = new Float32Array(MAX * 3);
+    const aSize  = new Float32Array(MAX);
+    const aActive = new Float32Array(MAX);
+
+    const PINK = [1.0, 0.41, 0.71];
+    const WHITE = [1.0, 1.0, 1.0];
+    for (let i = 0; i < MAX; i++) {
+      // 初始随机散布
+      positions[i*3+0] = (Math.random()-0.5) * viewW;
+      positions[i*3+1] = (Math.random()-0.5) * viewH;
+      positions[i*3+2] = (Math.random()-0.5) * 20;
+      const m = Math.random(); // 粉/白混合
+      aColor[i*3+0] = PINK[0] + (WHITE[0]-PINK[0]) * m;
+      aColor[i*3+1] = PINK[1] + (WHITE[1]-PINK[1]) * m;
+      aColor[i*3+2] = PINK[2] + (WHITE[2]-PINK[2]) * m;
+      aSize[i] = 0.6 + Math.random() * 0.9;
+      aActive[i] = (i < ACTIVE_TEXT) ? 1 : 0;
+    }
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geo.setAttribute("aColor", new THREE.BufferAttribute(aColor, 3));
+    geo.setAttribute("aSize", new THREE.BufferAttribute(aSize, 1));
+    geo.setAttribute("aActive", new THREE.BufferAttribute(aActive, 1));
+
+    const material = new THREE.ShaderMaterial({
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      uniforms: {
+        uSize: { value: 0.3 },
+        uPixelRatio: { value: renderer.getPixelRatio() }
+      },
+      vertexShader: `
+        attribute float aSize;
+        attribute vec3 aColor;
+        attribute float aActive;
+        uniform float uSize;
+        uniform float uPixelRatio;
+        varying vec3 vColor;
+        varying float vActive;
+        void main() {
+          vColor = aColor;
+          vActive = aActive;
+          vec4 mv = modelViewMatrix * vec4(position, 1.0);
+          gl_PointSize = aSize * uSize * uPixelRatio * (600.0 / -mv.z);
+          gl_Position = projectionMatrix * mv;
+        }
+      `,
+      fragmentShader: `
+        varying vec3 vColor;
+        varying float vActive;
+        void main() {
+          if (vActive < 0.5) discard;
+          vec2 c = gl_PointCoord - vec2(0.5);
+          float d = length(c);
+          if (d > 0.5) discard;
+          float alpha = smoothstep(0.5, 0.12, d);
+          gl_FragColor = vec4(vColor, alpha);
+        }
+      `
+    });
+
+    const points = new THREE.Points(geo, material);
+    scene.add(points);
+
+    // ---------- 形态采样（文字 / 爱心） ----------
+    let textCache = {};   // word -> [[x,y,z], ...]
+    let heartPts = [];    // [[x,y,z], ...]
+
+    function sampleTextPoints(text) {
+      const chars = Array.from(text);
+      const W = Math.max(1000, chars.length * 230);
+      const H = 360;
+      const cv = document.createElement("canvas");
+      cv.width = W; cv.height = H;
+      const ctx = cv.getContext("2d");
+      ctx.fillStyle = "#fff";
+      ctx.font = 'bold 190px "Microsoft YaHei", "PingFang SC", sans-serif';
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(text, W / 2, H / 2);
+      const data = ctx.getImageData(0, 0, W, H).data;
+      const cand = [];
+      for (let y = 0; y < H; y += 3) {
+        for (let x = 0; x < W; x += 3) {
+          if (data[(y * W + x) * 4 + 3] > 128) cand.push([x, y]);
+        }
+      }
+      if (cand.length === 0) return null;
+      const pts = [];
+      for (let i = 0; i < ACTIVE_TEXT; i++) {
+        const p = cand[(Math.random() * cand.length) | 0];
+        const wx = (p[0] / W - 0.5) * (viewW * 0.82);
+        const wy = (0.5 - p[1] / H) * (viewH * 0.34);
+        const wz = (Math.random() - 0.5) * 6;
+        pts.push([wx, wy, wz]);
+      }
+      return pts;
+    }
+
+    function buildHeartPoints() {
+      const pts = [];
+      const scale = viewH * 0.17;
+      const thick = viewH * 0.07;
+      let guard = 0;
+      while (pts.length < ACTIVE_HEART && guard < ACTIVE_HEART * 40) {
+        guard++;
+        const x = (Math.random() * 2 - 1) * 1.3;
+        const y = (Math.random() * 2 - 1) * 1.45;
+        // 2D 心形隐式方程：(x^2+y^2-1)^3 - x^2*y^3 <= 0
+        const v = Math.pow(x * x + y * y - 1, 3) - x * x * Math.pow(Math.max(y, 0), 3);
+        if (v <= 0) {
+          // 下半部分横向收紧：越靠近底部尖端，左右两侧收得越紧，消除左下/右下外扩的“角”
+          let nx = x;
+          if (y < 0.0) {
+            const u = Math.min(1, (-y) / 1.3);   // 0(腰部) -> 1(底部尖端)
+            nx = x * (1 - 0.45 * u);
+          }
+          const z = (Math.random() - 0.5) * thick;
+          pts.push([nx * scale, y * scale, z]);
+        }
+      }
+      return pts;
+    }
+
+    function buildFormations() {
+      computeView();
+      for (const k in WORDS) {
+        const pts = sampleTextPoints(WORDS[k]);
+        if (pts) textCache[WORDS[k]] = pts;
+      }
+      heartPts = buildHeartPoints();
+    }
+
+    // ---------- 手势状态（由 MediaPipe 更新） ----------
+    let state = "text";            // "text" | "heart"
+    let wantOpen = true;           // 右手是否张开
+    let leftMode = 1;             // 左手数字 1/2/3
+    let leftHandPresent = false;
+    let leftPalm = { x: 0.5, y: 0.5 }; // 归一化(已镜像)坐标
+    let rightHandPresent = false;
+    let rightAngle = 0, lastRightAngle = null;
+    let globalRotation = 0;        // 文字整体旋转角（跟随右手）
+
+    // ---------- 特征计算 ----------
+    function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+
+    function handInfo(lm) {
+      const tips = [8, 12, 16, 20], pips = [6, 10, 14, 18];
+      let fcount = 0;
+      for (let i = 0; i < 4; i++) {
+        if (lm[tips[i]].y < lm[pips[i]].y - 0.015) fcount++;
+      }
+      const handScale = dist(lm[0], lm[9]);
+      const thumbExt = dist(lm[4], lm[2]) > handScale * 0.5;
+      const total = fcount + (thumbExt ? 1 : 0);
+      return { fcount, total };
+    }
+
+    // ---------- MediaPipe 回调 ----------
+    function onResults(results) {
+      let left = null, right = null;
+      if (results.multiHandLandmarks && results.multiHandedness) {
+        for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+          const lm = results.multiHandLandmarks[i];
+          const label = results.multiHandedness[i].label; // "Left"/"Right"（自拍镜像含义）
+          const info = handInfo(lm);
+          if (label === "Left") left = { lm, info };
+          else right = { lm, info };
+        }
+      }
+
+      // 右手：张开/握拳 -> 扩散/收缩
+      if (right) {
+        rightHandPresent = true;
+        const t = right.info.total;
+        if (t >= 4) wantOpen = true;
+        else if (t <= 1) wantOpen = false;
+        // 朝向角（镜像屏幕坐标）
+        const sx1 = 1 - right.lm[0].x, sy1 = right.lm[0].y;
+        const sx2 = 1 - right.lm[9].x, sy2 = right.lm[9].y;
+        rightAngle = Math.atan2(sy2 - sy1, sx2 - sx1);
+      } else {
+        rightHandPresent = false;
+      }
+
+      // 左手：1/2/3 根手指 -> 文字模式
+      if (left) {
+        leftHandPresent = true;
+        const f = left.info.fcount;
+        if (f === 1 || f === 2 || f === 3) leftMode = f;
+        // 手掌中心（取中指根 lm[9]），镜像后归一化
+        leftPalm.x = 1 - left.lm[9].x;
+        leftPalm.y = left.lm[9].y;
+      } else {
+        leftHandPresent = false;
+      }
+
+      // 更新 HUD
+      document.getElementById("hud_mode").textContent = WORDS[leftMode];
+      document.getElementById("hud_right").textContent = wantOpen ? "展开(文字)" : "收缩(爱心)";
+      document.getElementById("hud_left").textContent = leftHandPresent ? left.info.fcount + " 指" : "未检测到";
+    }
+
+    // ---------- 主循环 ----------
+    const clock = new THREE.Clock();
+    let currentActive = ACTIVE_TEXT;
+
+    function setActive(n) {
+      for (let i = 0; i < MAX; i++) aActive[i] = (i < n) ? 1 : 0;
+      geo.attributes.aActive.needsUpdate = true;
+      currentActive = n;
+    }
+
+    function heartbeat(t) {
+      const bpm = 72, period = 60 / bpm;
+      const p = (t % period) / period;
+      const a = Math.exp(-Math.pow((p - 0.10) / 0.05, 2));
+      const b = Math.exp(-Math.pow((p - 0.26) / 0.06, 2)) * 0.6;
+      return 1 + 0.10 * (a + b);
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const t = clock.getElapsedTime();
+
+      // 状态切换与激活数量 / 粒子大小
+      const newState = wantOpen ? "text" : "heart";
+      if (newState !== state) {
+        state = newState;
+        if (state === "text") { setActive(ACTIVE_TEXT); material.uniforms.uSize.value = 0.3; }
+        else { setActive(ACTIVE_HEART); material.uniforms.uSize.value = 0.3; }
+      }
+
+      // 右手旋转 -> 文字旋转
+      if (state === "text" && rightHandPresent) {
+        if (lastRightAngle !== null) {
+          let d = rightAngle - lastRightAngle;
+          while (d > Math.PI) d -= Math.PI * 2;
+          while (d < -Math.PI) d += Math.PI * 2;
+          globalRotation += d * 1.2;
+        }
+        lastRightAngle = rightAngle;
+      } else {
+        lastRightAngle = null;
+      }
+
+      // 左手排斥区域（世界坐标）
+      let lwx = 0, lwy = 0, repel = false;
+      if (leftHandPresent) {
+        lwx = (leftPalm.x - 0.5) * viewW;
+        lwy = (0.5 - leftPalm.y) * viewH;
+        repel = true;
+      }
+      const R = 14, R2 = R * R, repStr = 2.2;
+
+      const beat = heartbeat(t);
+      const cosR = Math.cos(globalRotation), sinR = Math.sin(globalRotation);
+      const textArr = textCache[WORDS[leftMode]] || textCache[WORDS[1]];
+      const k = (state === "heart") ? 0.08 : 0.025; // 扩散时更慢
+      const damp = 0.86;
+
+      for (let i = 0; i < currentActive; i++) {
+        let tx, ty, tz;
+        if (state === "text") {
+          const p = textArr[i % textArr.length];
+          // 跟随右手旋转
+          tx = p[0] * cosR - p[1] * sinR;
+          ty = p[0] * sinR + p[1] * cosR;
+          tz = p[2];
+        } else {
+          const p = heartPts[i % heartPts.length];
+          tx = p[0] * beat; ty = p[1] * beat; tz = p[2] * beat;
+        }
+
+        let x = positions[i*3], y = positions[i*3+1], z = positions[i*3+2];
+        let vx = velocities[i*3], vy = velocities[i*3+1], vz = velocities[i*3+2];
+
+        // 弹簧趋向目标
+        vx += (tx - x) * k;
+        vy += (ty - y) * k;
+        vz += (tz - z) * k;
+
+        // 躲避左手区域（所有状态）
+        if (repel) {
+          const dx = x - lwx, dy = y - lwy;
+          const d2 = dx * dx + dy * dy;
+          if (d2 < R2) {
+            const d = Math.sqrt(d2) + 1e-3;
+            const f = (R - d) / R * repStr;
+            vx += dx / d * f;
+            vy += dy / d * f;
+            vz += (Math.random() - 0.5) * f * 0.4;
+          }
+        }
+
+        vx *= damp; vy *= damp; vz *= damp;
+        x += vx; y += vy; z += vz;
+
+        positions[i*3] = x; positions[i*3+1] = y; positions[i*3+2] = z;
+        velocities[i*3] = vx; velocities[i*3+1] = vy; velocities[i*3+2] = vz;
+      }
+      geo.attributes.position.needsUpdate = true;
+
+      renderer.render(scene, camera);
+    }
+
+    // ---------- 初始化 ----------
+    function showError(msg) {
+      const e = document.getElementById("err");
+      e.style.display = "flex";
+      e.textContent = msg;
+    }
+
+    function init() {
+      if (typeof THREE === "undefined") { showError("Three.js 加载失败，请检查网络后刷新。"); return; }
+      if (typeof Hands === "undefined" || typeof Camera === "undefined") {
+        showError("MediaPipe 加载失败，请检查网络后刷新。"); return;
+      }
+
+      buildFormations();
+      setActive(ACTIVE_TEXT);
+      animate();
+
+      const video = document.getElementById("input_video");
+      const hands = new Hands({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+      });
+      hands.setOptions({
+        maxNumHands: 2,
+        modelComplexity: 0,
+        minDetectionConfidence: 0.6,
+        minTrackingConfidence: 0.6
+      });
+      hands.onResults(onResults);
+
+      const cam = new Camera(video, {
+        onFrame: async () => { await hands.send({ image: video }); },
+        width: 1280,
+        height: 720
+      });
+      cam.start().catch((e) => showError("无法访问摄像头：" + e.message + "（需允许摄像头权限，并通过 https 或 localhost 打开）"));
+    }
+
+    window.addEventListener("resize", () => {
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      buildFormations(); // 重新生成贴合新尺寸的形态
+    });
+
+    window.addEventListener("load", init);
+  })();
+  </script>
+</body>
+</html>
